@@ -3,6 +3,7 @@
  *
  *  Kernel internal timers, basic process system calls
  *
+ *  Copyright (C) 2011-2013 Foxconn International Holdings, Ltd. All rights reserved.
  *  Copyright (C) 1991, 1992  Linus Torvalds
  *
  *  1997-01-28  Modified by Finn Arne Gangstad to make timers scale better.
@@ -584,7 +585,8 @@ static inline void
 debug_activate(struct timer_list *timer, unsigned long expires)
 {
 	debug_timer_activate(timer);
-	trace_timer_start(timer, expires);
+	trace_timer_start(timer, expires,
+			 tbase_get_deferrable(timer->base) > 0 ? 'y' : 'n');
 }
 
 static inline void debug_deactivate(struct timer_list *timer)
@@ -1678,12 +1680,12 @@ static int __cpuinit init_timers_cpu(int cpu)
 			boot_done = 1;
 			base = &boot_tvec_bases;
 		}
+		spin_lock_init(&base->lock);
 		tvec_base_done[cpu] = 1;
 	} else {
 		base = per_cpu(tvec_bases, cpu);
 	}
 
-	spin_lock_init(&base->lock);
 
 	for (j = 0; j < TVN_SIZE; j++) {
 		INIT_LIST_HEAD(base->tv5.vec + j);
@@ -1818,6 +1820,64 @@ unsigned long msleep_interruptible(unsigned int msecs)
 }
 
 EXPORT_SYMBOL(msleep_interruptible);
+
+/*CORE-EL-sleep-func-00+[*/
+#ifdef CONFIG_FIH_HR_MSLEEP
+static void do_nsleep(unsigned int nsecs, struct hrtimer_sleeper *sleeper, int sigs)
+{
+	enum hrtimer_mode mode = HRTIMER_MODE_REL;
+	int state = sigs ? TASK_INTERRUPTIBLE: TASK_UNINTERRUPTIBLE;
+
+	/*
+	 * This is really just a reworked and simplified verson
+	 * of do_nanosleep().
+	 */
+	hrtimer_init(&sleeper->timer, CLOCK_MONOTONIC, mode);
+	sleeper->timer.node.expires = ktime_set(0, nsecs);
+	hrtimer_init_sleeper(sleeper, current);
+
+	do {
+		set_current_state(state);
+		hrtimer_start(&sleeper->timer, sleeper->timer.node.expires, mode);
+		if (sleeper->task)
+			schedule();
+		hrtimer_cancel(&sleeper->timer);
+		mode = HRTIMER_MODE_ABS;
+	} while (sleeper->task && !(sigs && signal_pending(current)));
+}
+
+/**
+ * msleep - sleep safely even with waitqueue interruptions
+ * @msecs: Time in milliseconds to sleep for
+ */
+void hr_msleep(unsigned int msecs)
+{
+	struct hrtimer_sleeper sleeper;
+	
+	do_nsleep(msecs * NSEC_PER_MSEC, &sleeper, 0);
+}
+
+EXPORT_SYMBOL(hr_msleep);
+
+/**
+ * msleep_interruptible - sleep waiting for signals
+ * @msecs: Time in milliseconds to sleep for
+ */
+unsigned long hr_msleep_interruptible(unsigned int msecs)
+{
+	struct hrtimer_sleeper sleeper;
+	ktime_t left;
+
+	do_nsleep(msecs * NSEC_PER_MSEC, &sleeper, 1);
+	
+	if (!sleeper.task)
+		return 0;
+	left = ktime_sub(sleeper.timer.node.expires, sleeper.timer.base->get_time());
+	return max(((long) ktime_to_ns(left))/(long)NSEC_PER_MSEC, 1L);
+}
+EXPORT_SYMBOL(hr_msleep_interruptible);
+#endif
+/*CORE-EL-sleep-func-00+]*/
 
 static int __sched do_usleep_range(unsigned long min, unsigned long max)
 {

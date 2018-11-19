@@ -4,6 +4,7 @@
  *  Copyright (C) 1999 Ingo Molnar
  *                1999 Kanoj Sarcar, SGI
  *                2008 Johannes Weiner
+ *  Copyright(C) 2011-2013 Foxconn International Holdings, Ltd. All rights reserved.
  *
  * Access to this subsystem has to be serialized externally (which is true
  * for the boot process anyway).
@@ -154,7 +155,7 @@ unsigned long __init init_bootmem(unsigned long start, unsigned long pages)
  * down, but we are still initializing the system.  Pages are given directly
  * to the page allocator, no bootmem metadata is updated because it is gone.
  */
-void __init free_bootmem_late(unsigned long addr, unsigned long size)
+void free_bootmem_late(unsigned long addr, unsigned long size)
 {
 	unsigned long cursor, end;
 
@@ -434,6 +435,9 @@ int __init reserve_bootmem(unsigned long addr, unsigned long size,
 
 	start = PFN_DOWN(addr);
 	end = PFN_UP(addr + size);
+    /* FIH-CORE-TH-DebugToolPorting-00*[ */
+	printk(KERN_INFO "Memory reserve start 0x%08X size 0x%08X flag %d", (int)addr, (int)size, flags);
+    /* FIH-CORE-TH-DebugToolPorting-00*] */
 
 	return mark_bootmem(start, end, 1, flags);
 }

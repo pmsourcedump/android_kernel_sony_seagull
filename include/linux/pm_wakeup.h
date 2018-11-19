@@ -3,6 +3,7 @@
  *
  *  Copyright (C) 2008 Alan Stern
  *  Copyright (C) 2010 Rafael J. Wysocki, Novell Inc.
+ *  Copyright (C) 2011-2013 Foxconn International Holdings, Ltd. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -33,12 +34,15 @@
  *
  * @total_time: Total time this wakeup source has been active.
  * @max_time: Maximum time this wakeup source has been continuously active.
- * @last_time: Monotonic clock when the wakeup source's was activated last time.
+ * @last_time: Monotonic clock when the wakeup source's was touched last time.
+ * @prevent_sleep_time: Total time this source has been preventing autosleep.
  * @event_count: Number of signaled wakeup events.
  * @active_count: Number of times the wakeup sorce was activated.
  * @relax_count: Number of times the wakeup sorce was deactivated.
- * @hit_count: Number of times the wakeup sorce might abort system suspend.
+ * @expire_count: Number of times the wakeup source's timeout has expired.
+ * @wakeup_count: Number of times the wakeup source might abort suspend.
  * @active: Status of the wakeup source.
+ * @has_timeout: The wakeup source has been activated with a timeout.
  */
 struct wakeup_source {
 	const char 		*name;
@@ -49,11 +53,15 @@ struct wakeup_source {
 	ktime_t total_time;
 	ktime_t max_time;
 	ktime_t last_time;
+	ktime_t start_prevent_time;
+	ktime_t prevent_sleep_time;
 	unsigned long		event_count;
 	unsigned long		active_count;
 	unsigned long		relax_count;
-	unsigned long		hit_count;
-	unsigned int		active:1;
+	unsigned long		expire_count;
+	unsigned long		wakeup_count;
+	bool			active:1;
+	bool			autosleep_enabled:1;
 };
 
 #ifdef CONFIG_PM_SLEEP
@@ -71,6 +79,19 @@ static inline bool device_may_wakeup(struct device *dev)
 {
 	return dev->power.can_wakeup && !!dev->power.wakeup;
 }
+
+//CORE-BH-PMSWakelockInfo-01*[
+#ifdef CONFIG_FIH_DUMP_WAKELOCK
+struct pms_wake_lock {
+	struct list_head	link;
+	char				*pid;
+	char				*tag;
+};
+
+ void add_pms_wakelock_info(char *pid, char * tag);
+ void remove_pms_wakelock_info(void);
+ #endif
+//CORE-BH-PMSWakelockInfo-01*]
 
 /* drivers/base/power/wakeup.c */
 extern void wakeup_source_prepare(struct wakeup_source *ws, const char *name);

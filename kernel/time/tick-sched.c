@@ -4,6 +4,7 @@
  *  Copyright(C) 2005-2006, Thomas Gleixner <tglx@linutronix.de>
  *  Copyright(C) 2005-2007, Red Hat, Inc., Ingo Molnar
  *  Copyright(C) 2006-2007  Timesys Corp., Thomas Gleixner
+ *  Copyright(C) 2011-2013 Foxconn International Holdings, Ltd. All rights reserved.
  *
  *  No idle tick implementation for low and high resolution timers
  *
@@ -20,11 +21,18 @@
 #include <linux/profile.h>
 #include <linux/sched.h>
 #include <linux/module.h>
+#include <linux/rq_stats.h>
 
 #include <asm/irq_regs.h>
 
 #include "tick-internal.h"
 
+
+struct rq_data rq_info;
+struct workqueue_struct *rq_wq;
+spinlock_t rq_lock;
+
+extern void count_cpu_time(void); /*Kernel-TH-add-cpu-usage-func-00+*/
 /*
  * Per cpu nohz control structure
  */
@@ -80,6 +88,8 @@ static void tick_do_update_jiffies64(ktime_t now)
 		tick_next_period = ktime_add(last_jiffies_update, tick_period);
 	}
 	write_sequnlock(&xtime_lock);
+	
+	count_cpu_time(); /*Kernel-TH-add-cpu-usage-func-00+*/
 }
 
 /*
@@ -441,7 +451,6 @@ static void tick_nohz_stop_sched_tick(struct tick_sched *ts)
 out:
 	ts->next_jiffies = next_jiffies;
 	ts->last_jiffies = last_jiffies;
-	ts->sleep_length = ktime_sub(dev->next_event, now);
 }
 
 /**
@@ -510,8 +519,8 @@ void tick_nohz_irq_exit(void)
 ktime_t tick_nohz_get_sleep_length(void)
 {
 	struct tick_sched *ts = &__get_cpu_var(tick_cpu_sched);
-
-	return ts->sleep_length;
+	struct clock_event_device *dev = __get_cpu_var(tick_cpu_device).evtdev;
+	return ktime_sub(dev->next_event, ts->idle_entrytime);
 }
 
 static void tick_nohz_restart(struct tick_sched *ts, ktime_t now)
@@ -760,6 +769,50 @@ void tick_check_idle(int cpu)
  * High resolution timer specific code
  */
 #ifdef CONFIG_HIGH_RES_TIMERS
+static void update_rq_stats(void)
+{
+	unsigned long jiffy_gap = 0;
+	unsigned int rq_avg = 0;
+	unsigned long flags = 0;
+
+	jiffy_gap = jiffies - rq_info.rq_poll_last_jiffy;
+
+	if (jiffy_gap >= rq_info.rq_poll_jiffies) {
+
+		spin_lock_irqsave(&rq_lock, flags);
+
+		if (!rq_info.rq_avg)
+			rq_info.rq_poll_total_jiffies = 0;
+
+		rq_avg = nr_running() * 10;
+
+		if (rq_info.rq_poll_total_jiffies) {
+			rq_avg = (rq_avg * jiffy_gap) +
+				(rq_info.rq_avg *
+				 rq_info.rq_poll_total_jiffies);
+			do_div(rq_avg,
+			       rq_info.rq_poll_total_jiffies + jiffy_gap);
+		}
+
+		rq_info.rq_avg =  rq_avg;
+		rq_info.rq_poll_total_jiffies += jiffy_gap;
+		rq_info.rq_poll_last_jiffy = jiffies;
+
+		spin_unlock_irqrestore(&rq_lock, flags);
+	}
+}
+
+static void wakeup_user(void)
+{
+	unsigned long jiffy_gap;
+
+	jiffy_gap = jiffies - rq_info.def_timer_last_jiffy;
+
+	if (jiffy_gap >= rq_info.def_timer_jiffies) {
+		rq_info.def_timer_last_jiffy = jiffies;
+		queue_work(rq_wq, &rq_info.def_timer_work);
+	}
+}
 /*
  * We rearm the timer until we get disabled by the idle code.
  * Called with interrupts disabled and timer->base->cpu_base->lock held.
@@ -807,6 +860,19 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 		}
 		update_process_times(user_mode(regs));
 		profile_tick(CPU_PROFILING);
+
+		if ((rq_info.init == 1) && (tick_do_timer_cpu == cpu)) {
+
+			/*
+			 * update run queue statistics
+			 */
+			update_rq_stats();
+
+			/*
+			 * wakeup user if needed
+			 */
+			wakeup_user();
+		}
 	}
 
 	hrtimer_forward(timer, now, tick_period);

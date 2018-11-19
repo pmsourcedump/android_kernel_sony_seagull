@@ -5,6 +5,8 @@
  *  Copyright (c) 1999 Andreas Gal
  *  Copyright (c) 2000-2001 Vojtech Pavlik
  *  Copyright (c) 2006-2007 Jiri Kosina
+ *  Copyright 2011,2012 Sony Corporation
+ *  Copyright (c) 2012 Sony Mobile Communications AB.
  */
 
 /*
@@ -286,6 +288,14 @@ struct hid_item {
 #define HID_INPUT_REPORT	0
 #define HID_OUTPUT_REPORT	1
 #define HID_FEATURE_REPORT	2
+#ifdef CONFIG_HID_SONY_PS3_CTRL_BT
+/* feature report with data size */
+#define HID_FEATREP_WDATASIZE	3
+/* feature report skip report id */
+#define HID_FEATREP_SKIPREPID	4
+/* output report skip report id */
+#define HID_OUTREP_SKIPREPID	5
+#endif
 
 /*
  * HID connect requests
@@ -618,6 +628,8 @@ struct hid_usage_id {
  * @input_mapping: invoked on input registering before mapping an usage
  * @input_mapped: invoked on input registering after mapping an usage
  * @feature_mapping: invoked on feature registering
+ * @input_register: called just before input device is registered after reports
+ * 		    are parsed.
  * @suspend: invoked on suspend (NULL means nop)
  * @resume: invoked on resume if device was not reset (NULL means nop)
  * @reset_resume: invoked on resume if device was reset (NULL means nop)
@@ -664,6 +676,8 @@ struct hid_driver {
 	void (*feature_mapping)(struct hid_device *hdev,
 			struct hid_field *field,
 			struct hid_usage *usage);
+	int (*input_register)(struct hid_device *hdev, struct hid_input
+			*hidinput);
 #ifdef CONFIG_PM
 	int (*suspend)(struct hid_device *hdev, pm_message_t message);
 	int (*resume)(struct hid_device *hdev);

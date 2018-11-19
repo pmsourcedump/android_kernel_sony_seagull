@@ -4,6 +4,7 @@
  * Copyright (C) 2003-2008 Alan Stern
  * Copyeight (C) 2009 Samsung Electronics
  * Author: Michal Nazarewicz (mina86@mina86.com)
+ * Copyright (C) 2012 Sony Mobile Communications AB.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -182,6 +183,12 @@ struct interrupt_data {
 #define ASC(x)		((u8) ((x) >> 8))
 #define ASCQ(x)		((u8) (x))
 
+/*CONN-EH-SCSI-00+{*/
+/* VPD(Vital product data) Page Name */
+#define VPD_SUPPORTED_VPD_PAGES		0x00
+#define VPD_UNIT_SERIAL_NUMBER		0x80
+#define VPD_DEVICE_IDENTIFICATION	0x83
+/*CONN-EH-SCSI-00+}*/
 
 /*-------------------------------------------------------------------------*/
 
@@ -207,6 +214,18 @@ struct fsg_lun {
 	unsigned int	blkbits;	/* Bits of logical block size of bound block device */
 	unsigned int	blksize;	/* logical block size of bound block device */
 	struct device	dev;
+	char		*lun_filename;/*CONN-EH-SCSI-00+*/
+#ifdef CONFIG_USB_MSC_PROFILING
+	spinlock_t	lock;
+	struct {
+
+		unsigned long rbytes;
+		unsigned long wbytes;
+		ktime_t rtime;
+		ktime_t wtime;
+	} perf;
+
+#endif
 };
 
 #define fsg_lun_is_open(curlun)	((curlun)->filp != NULL)
@@ -221,6 +240,9 @@ static struct fsg_lun *fsg_lun_from_dev(struct device *dev)
 #define EP0_BUFSIZE	256
 #define DELAYED_STATUS	(EP0_BUFSIZE + 999)	/* An impossibly large value */
 
+#ifdef CONFIG_USB_CSW_HACK
+#define fsg_num_buffers		4
+#else
 #ifdef CONFIG_USB_GADGET_DEBUG_FILES
 
 static unsigned int fsg_num_buffers = CONFIG_USB_GADGET_STORAGE_NUM_BUFFERS;
@@ -236,6 +258,7 @@ MODULE_PARM_DESC(num_buffers, "Number of pipeline buffers");
 #define fsg_num_buffers	CONFIG_USB_GADGET_STORAGE_NUM_BUFFERS
 
 #endif /* CONFIG_USB_DEBUG */
+#endif /* CONFIG_USB_CSW_HACK */
 
 /* check if fsg_num_buffers is within a valid range */
 static inline int fsg_num_buffers_validate(void)
@@ -786,6 +809,43 @@ static ssize_t fsg_show_nofua(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%u\n", curlun->nofua);
 }
 
+#ifdef CONFIG_USB_MSC_PROFILING
+static ssize_t fsg_show_perf(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct fsg_lun	*curlun = fsg_lun_from_dev(dev);
+	unsigned long rbytes, wbytes;
+	int64_t rtime, wtime;
+
+	spin_lock(&curlun->lock);
+	rbytes = curlun->perf.rbytes;
+	wbytes = curlun->perf.wbytes;
+	rtime = ktime_to_us(curlun->perf.rtime);
+	wtime = ktime_to_us(curlun->perf.wtime);
+	spin_unlock(&curlun->lock);
+
+	return snprintf(buf, PAGE_SIZE, "Write performance :"
+					"%lu bytes in %lld microseconds\n"
+					"Read performance :"
+					"%lu bytes in %lld microseconds\n",
+					wbytes, wtime, rbytes, rtime);
+}
+static ssize_t fsg_store_perf(struct device *dev, struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	struct fsg_lun	*curlun = fsg_lun_from_dev(dev);
+	int value;
+
+	sscanf(buf, "%d", &value);
+	if (!value) {
+		spin_lock(&curlun->lock);
+		memset(&curlun->perf, 0, sizeof(curlun->perf));
+		spin_unlock(&curlun->lock);
+	}
+
+	return count;
+}
+#endif
 static ssize_t fsg_show_file(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
@@ -872,10 +932,16 @@ static ssize_t fsg_store_file(struct device *dev, struct device_attribute *attr,
 	struct rw_semaphore	*filesem = dev_get_drvdata(dev);
 	int		rc = 0;
 
+
+#if !defined(CONFIG_USB_G_ANDROID)
+	/* disabled in android because we need to allow closing the backing file
+	 * if the media was removed
+	 */
 	if (curlun->prevent_medium_removal && fsg_lun_is_open(curlun)) {
 		LDBG(curlun, "eject attempt prevented\n");
 		return -EBUSY;				/* "Door is locked" */
 	}
+#endif
 
 	/* Remove a trailing newline */
 	if (count > 0 && buf[count-1] == '\n')
@@ -886,14 +952,30 @@ static ssize_t fsg_store_file(struct device *dev, struct device_attribute *attr,
 	if (fsg_lun_is_open(curlun)) {
 		fsg_lun_close(curlun);
 		curlun->unit_attention_data = SS_MEDIUM_NOT_PRESENT;
+		kfree(curlun->lun_filename);/*CONN-EH-SCSI-00+*/
+		curlun->lun_filename = NULL;/*CONN-EH-SCSI-00+*/
 	}
 
 	/* Load new medium */
 	if (count > 0 && buf[0]) {
 		rc = fsg_lun_open(curlun, buf);
-		if (rc == 0)
+                /*CONN-EH-SCSI-00+{*/
+		if (rc == 0){
+			kfree(curlun->lun_filename);
+			curlun->lun_filename = kmalloc(count+1, GFP_KERNEL);
+			if (!curlun->lun_filename) {
+				rc = -ENOMEM;
+				fsg_lun_close(curlun);
+				curlun->unit_attention_data =
+					SS_MEDIUM_NOT_PRESENT;
+			} else {
+				memcpy(curlun->lun_filename, buf, count);
+				curlun->lun_filename[count] = '\0';
 			curlun->unit_attention_data =
 					SS_NOT_READY_TO_READY_TRANSITION;
+	}
+		}
+                /*CONN-EH-SCSI-00+}*/
 	}
 	up_write(filesem);
 	return (rc < 0 ? rc : count);

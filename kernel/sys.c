@@ -1,6 +1,7 @@
 /*
  *  linux/kernel/sys.c
  *
+ *  Copyright (C) 2014 Foxconn International Holdings, Ltd. All rights reserved.
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
@@ -53,6 +54,7 @@
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/unistd.h>
+#include <linux/fih_sw_info.h> /* MTD-CORE-EL-AddPocForSwReset-00+ */
 
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a,b)	(-EINVAL)
@@ -354,6 +356,7 @@ int unregister_reboot_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL(unregister_reboot_notifier);
 
+extern void write_pwron_cause (int pwron_cause); /* MTD-CORE-EL-AddPocForSwReset-00+ */
 /**
  *	kernel_restart - reboot the system
  *	@cmd: pointer to buffer containing command to execute for restart
@@ -365,6 +368,15 @@ EXPORT_SYMBOL(unregister_reboot_notifier);
 void kernel_restart(char *cmd)
 {
 	kernel_restart_prepare(cmd);
+/* MTD-CORE-EL-AddPocForSwReset-01*[ */
+	if (cmd == NULL || cmd[0] == '\0')	{
+		cmd = "swreset";
+		printk(KERN_EMERG "snoop cmd with %s\n", cmd);
+	}
+	
+	printk(KERN_EMERG "Software Reset. Let's note!\n");
+	write_pwron_cause(SOFTWARE_RESET);
+/* MTD-CORE-EL-AddPocForSwReset-01*] */
 	if (!cmd)
 		printk(KERN_EMERG "Restarting system.\n");
 	else
@@ -1179,15 +1191,16 @@ DECLARE_RWSEM(uts_sem);
  * Work around broken programs that cannot handle "Linux 3.0".
  * Instead we map 3.x to 2.6.40+x, so e.g. 3.0 would be 2.6.40
  */
-static int override_release(char __user *release, int len)
+static int override_release(char __user *release, size_t len)
 {
 	int ret = 0;
-	char buf[65];
 
 	if (current->personality & UNAME26) {
-		char *rest = UTS_RELEASE;
+		const char *rest = UTS_RELEASE;
+		char buf[65] = { 0 };
 		int ndots = 0;
 		unsigned v;
+		size_t copy;
 
 		while (*rest) {
 			if (*rest == '.' && ++ndots >= 3)
@@ -1197,8 +1210,9 @@ static int override_release(char __user *release, int len)
 			rest++;
 		}
 		v = ((LINUX_VERSION_CODE >> 8) & 0xff) + 40;
-		snprintf(buf, len, "2.6.%u%s", v, rest);
-		ret = copy_to_user(release, buf, len);
+		copy = min(sizeof(buf), max_t(size_t, 1, len));
+		copy = scnprintf(buf, copy, "2.6.%u%s", v, rest);
+		ret = copy_to_user(release, buf, copy + 1);
 	}
 	return ret;
 }

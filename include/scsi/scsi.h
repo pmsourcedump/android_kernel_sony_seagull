@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/scatterlist.h>
+#include <linux/device.h>
 
 struct scsi_cmnd;
 
@@ -77,6 +78,7 @@ struct scsi_cmnd;
 #define READ_FORMAT_CAPACITIES 0x23
 #define SET_WINDOW            0x24
 #define READ_CAPACITY         0x25
+#define READ_CAPACITY_16      0x9e/*CONN-EH-SCSI-00+*/
 #define READ_10               0x28
 #define WRITE_10              0x2a
 #define SEEK_10               0x2b
@@ -561,5 +563,7 @@ static inline __u32 scsi_to_u32(__u8 *ptr)
 {
 	return (ptr[0]<<24) + (ptr[1]<<16) + (ptr[2]<<8) + ptr[3];
 }
+
+struct scsi_disk *scsi_disk_get_from_dev(struct device *dev);
 
 #endif /* _SCSI_SCSI_H */

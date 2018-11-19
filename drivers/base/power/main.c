@@ -1,6 +1,7 @@
 /*
  * drivers/base/power/main.c - Where the driver meets power management.
  *
+ * Copyright (c) 2011-2013 Foxconn International Holdings, Ltd. All rights reserved.
  * Copyright (c) 2003 Patrick Mochel
  * Copyright (c) 2003 Open Source Development Lab
  *
@@ -28,9 +29,28 @@
 #include <linux/sched.h>
 #include <linux/async.h>
 #include <linux/suspend.h>
+#include <linux/timer.h>
 
 #include "../base.h"
 #include "power.h"
+
+/* CORE-EL-DBG_RESUME-00+[ */	
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+
+/* When enabled, we show driver resume time */
+enum {
+	DEBUG_ALL_DRIVER = 1U << 0, /* when enable this, print all */
+	DEBUG_BY_DRIVER_NAME = 1U << 1,
+	DEBUG_BY_FUNCTION_NAME = 1U << 2,
+	DEBUG_BY_RESUME_TIME = 1U << 3,
+};
+
+/* the file node will be /sys/module/main/parameters/debug_mask */
+static uint __read_mostly debug_mask;
+module_param(debug_mask, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(debug_mask, "mask for debugging resume time");
+/* CORE-EL-DBG_RESUME-00+] */	
 
 typedef int (*pm_callback_t)(struct device *);
 
@@ -53,6 +73,12 @@ LIST_HEAD(dpm_noirq_list);
 struct suspend_stats suspend_stats;
 static DEFINE_MUTEX(dpm_list_mtx);
 static pm_message_t pm_transition;
+
+static void dpm_drv_timeout(unsigned long data);
+struct dpm_drv_wd_data {
+	struct device *dev;
+	struct task_struct *tsk;
+};
 
 static int async_error;
 
@@ -564,7 +590,12 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
 	pm_callback_t callback = NULL;
 	char *info = NULL;
 	int error = 0;
-	bool put = false;
+/* CORE-EL-DBG_RESUME-00+[ */	
+	ktime_t starttime;
+
+	if (debug_mask)
+		starttime = ktime_get();
+/* CORE-EL-DBG_RESUME-00+] */
 
 	TRACE_DEVICE(dev);
 	TRACE_RESUME(0);
@@ -582,7 +613,6 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
 		goto Unlock;
 
 	pm_runtime_enable(dev);
-	put = true;
 
 	if (dev->pm_domain) {
 		info = "power domain ";
@@ -627,6 +657,26 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
 
  End:
 	error = dpm_run_callback(callback, dev, state, info);
+
+/* CORE-EL-DBG_RESUME-00+[ */
+	if (debug_mask & DEBUG_ALL_DRIVER) {
+		u64 usecs64;
+		int usecs;
+		char symbol_buf[KSYM_SYMBOL_LEN];
+		ktime_t endtime = ktime_get();
+		
+		sprint_symbol(symbol_buf, (unsigned long)callback);
+		
+		usecs64 = ktime_to_ns(ktime_sub(endtime, starttime));
+		
+		do_div(usecs64, NSEC_PER_USEC);
+		usecs = usecs64;
+
+		printk("[PM]pm resume: %s: %s costs %ld.%03ld ms\n",
+			symbol_buf, (dev->kobj.name) ? dev->kobj.name : "", 
+			usecs / USEC_PER_MSEC , usecs % USEC_PER_MSEC);
+	}
+/* CORE-EL-DBG_RESUME-00+] */	
 	dev->power.is_suspended = false;
 
  Unlock:
@@ -634,9 +684,6 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
 	complete_all(&dev->power.completion);
 
 	TRACE_RESUME(error);
-
-	if (put)
-		pm_runtime_put_sync(dev);
 
 	return error;
 }
@@ -656,6 +703,30 @@ static bool is_async(struct device *dev)
 {
 	return dev->power.async_suspend && pm_async_enabled
 		&& !pm_trace_is_enabled();
+}
+
+/**
+ *	dpm_drv_timeout - Driver suspend / resume watchdog handler
+ *	@data: struct device which timed out
+ *
+ * 	Called when a driver has timed out suspending or resuming.
+ * 	There's not much we can do here to recover so
+ * 	BUG() out for a crash-dump
+ *
+ */
+static void dpm_drv_timeout(unsigned long data)
+{
+	struct dpm_drv_wd_data *wd_data = (void *)data;
+	struct device *dev = wd_data->dev;
+	struct task_struct *tsk = wd_data->tsk;
+
+	printk(KERN_EMERG "**** DPM device timeout: %s (%s)\n", dev_name(dev),
+	       (dev->driver ? dev->driver->name : "no driver"));
+
+	printk(KERN_EMERG "dpm suspend stack:\n");
+	show_stack(tsk, NULL);
+
+	BUG();
 }
 
 /**
@@ -748,6 +819,8 @@ static void device_complete(struct device *dev, pm_message_t state)
 	}
 
 	device_unlock(dev);
+
+	pm_runtime_put_sync(dev);
 }
 
 /**
@@ -889,6 +962,11 @@ static int dpm_suspend_noirq(pm_message_t state)
 		if (!list_empty(&dev->power.entry))
 			list_move(&dev->power.entry, &dpm_noirq_list);
 		put_device(dev);
+
+		if (pm_wakeup_pending()) {
+			error = -EBUSY;
+			break;
+		}
 	}
 	mutex_unlock(&dpm_list_mtx);
 	if (error)
@@ -962,6 +1040,11 @@ static int dpm_suspend_late(pm_message_t state)
 		if (!list_empty(&dev->power.entry))
 			list_move(&dev->power.entry, &dpm_late_early_list);
 		put_device(dev);
+
+		if (pm_wakeup_pending()) {
+			error = -EBUSY;
+			break;
+		}
 	}
 	mutex_unlock(&dpm_list_mtx);
 	if (error)
@@ -979,8 +1062,16 @@ static int dpm_suspend_late(pm_message_t state)
 int dpm_suspend_end(pm_message_t state)
 {
 	int error = dpm_suspend_late(state);
+	if (error)
+		return error;
 
-	return error ? : dpm_suspend_noirq(state);
+	error = dpm_suspend_noirq(state);
+	if (error) {
+		dpm_resume_early(state);
+		return error;
+	}
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(dpm_suspend_end);
 
@@ -1017,21 +1108,35 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 	pm_callback_t callback = NULL;
 	char *info = NULL;
 	int error = 0;
+	struct timer_list timer;
+	struct dpm_drv_wd_data data;
 
 	dpm_wait_for_children(dev, async);
 
 	if (async_error)
-		return 0;
+		goto Complete;
 
-	pm_runtime_get_noresume(dev);
+	/*
+	 * If a device configured to wake up the system from sleep states
+	 * has been suspended at run time and there's a resume request pending
+	 * for it, this is equivalent to the device signaling wakeup, so the
+	 * system suspend operation should be aborted.
+	 */
 	if (pm_runtime_barrier(dev) && device_may_wakeup(dev))
 		pm_wakeup_event(dev, 0);
 
 	if (pm_wakeup_pending()) {
-		pm_runtime_put_sync(dev);
 		async_error = -EBUSY;
-		return 0;
+		goto Complete;
 	}
+
+	data.dev = dev;
+	data.tsk = get_current();
+	init_timer_on_stack(&timer);
+	timer.expires = jiffies + HZ * 12;
+	timer.function = dpm_drv_timeout;
+	timer.data = (unsigned long)&data;
+	add_timer(&timer);
 
 	device_lock(dev);
 
@@ -1054,6 +1159,12 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 			goto Run;
 		} else if (dev->class->suspend) {
 			pm_dev_dbg(dev, state, "legacy class ");
+
+            /*KERNEL-SC-SUSPEND_RESUME_WAKELOCK_LOG-01+[ */
+            #ifdef CONFIG_FIH_SUSPEND_RESUME_LOG
+            print_symbol("[PM]class suspend: %s\n", (unsigned long)dev->class->suspend);
+            #endif
+            /*KERNEL-SC-SUSPEND_RESUME_WAKELOCK_LOG-01+] */
 			error = legacy_suspend(dev, state, dev->class->suspend);
 			goto End;
 		}
@@ -1087,14 +1198,17 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 	}
 
 	device_unlock(dev);
+
+	del_timer_sync(&timer);
+	destroy_timer_on_stack(&timer);
+
+ Complete:
 	complete_all(&dev->power.completion);
 
-	if (error) {
-		pm_runtime_put_sync(dev);
+	if (error)
 		async_error = error;
-	} else if (dev->power.is_suspended) {
+	else if (dev->power.is_suspended)
 		__pm_runtime_disable(dev, false);
-	}
 
 	return error;
 }
@@ -1186,6 +1300,14 @@ static int device_prepare(struct device *dev, pm_message_t state)
 	int (*callback)(struct device *) = NULL;
 	char *info = NULL;
 	int error = 0;
+
+	/*
+	 * If a device's parent goes into runtime suspend at the wrong time,
+	 * it won't be possible to resume the device.  To prevent this we
+	 * block runtime suspend here, during the prepare phase, and allow
+	 * it again during the complete phase.
+	 */
+	pm_runtime_get_noresume(dev);
 
 	device_lock(dev);
 
